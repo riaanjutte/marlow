@@ -31,7 +31,11 @@ def _minimal_env(tmp_path: Path, **extra: str) -> dict[str, str]:
 
 @pytest.fixture
 def stub_settings(tmp_path, monkeypatch):
-    monkeypatch.setattr(entrypoint, "settings", replace(settings, working_dir=tmp_path))
+    # data_dir too: the last-good schedules copy lives there, and the suite's
+    # shared one would leak a copy from one test into the next.
+    monkeypatch.setattr(
+        entrypoint, "settings", replace(settings, working_dir=tmp_path, data_dir=tmp_path / "data")
+    )
     return tmp_path
 
 
@@ -408,3 +412,113 @@ def test_a_one_off_job_invoked_early_neither_fires_nor_prunes(stub_settings, mon
     assert entrypoint.main(["entrypoint.py", "--entry", "cabot-trail-check"]) == 0
     stored = json.loads((stub_settings / "cron" / "schedules.json").read_text())
     assert [entry["id"] for entry in stored["entries"]] == ["cabot-trail-check"]
+
+
+def _write_last_good(root: Path, entries: list[dict], timezone: str = "UTC") -> None:
+    data_dir = root / "data"
+    data_dir.mkdir(exist_ok=True)
+    (data_dir / "schedules.last-good.json").write_text(
+        json.dumps({"timezone": timezone, "entries": entries})
+    )
+
+
+def test_a_rejected_store_still_fires_reminders_from_the_last_good_copy(stub_settings, monkeypatch):
+    """A refused edit keeps the last good crontab installed (sync_after_turn),
+    so its lines keep firing -- but each one re-reads the store at fire time.
+    Reading only the refused store, every kept reminder fired nothing."""
+    meds = {"id": "meds", "cron": "0 12 * * *", "notify": "Take your meds"}
+    _write_last_good(stub_settings, [meds])
+    # Seconds in `at` are refused, and one bad entry refuses the whole store.
+    _write_schedules(stub_settings, [meds, {"id": "bad", "at": "2099-10-28T15:00:00", "notify": "x"}])
+    posted = []
+    monkeypatch.setattr(
+        entrypoint,
+        "post_notification",
+        lambda entry_id, text, client_msg_id: posted.append((entry_id, text)) or {"turn_id": "t"},
+    )
+
+    assert entrypoint.main(["entrypoint.py", "--entry", "meds"]) == 0
+    assert posted == [("meds", "Take your meds")]
+
+
+def test_a_deleted_store_is_not_resurrected_from_the_last_good_copy(stub_settings, monkeypatch):
+    """No store is a decision (sync renders an empty table), not a bad edit."""
+    _write_last_good(stub_settings, [{"id": "meds", "cron": "0 12 * * *", "notify": "Take your meds"}])
+    monkeypatch.setattr(
+        entrypoint,
+        "post_notification",
+        lambda *args, **kwargs: pytest.fail("a deleted store must not fire from the copy"),
+    )
+
+    assert entrypoint.main(["entrypoint.py", "--entry", "meds"]) == 1
+
+
+def test_an_unreachable_server_is_retried_once(monkeypatch):
+    """A server mid-restart at the job's minute is the common case."""
+    attempts = []
+
+    def flaky(sock, path, body, timeout):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise entrypoint.InternalAPIError("could not reach")
+        return {"turn_id": "t"}
+
+    monkeypatch.setattr(entrypoint, "post_json", flaky)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    assert entrypoint.post_job("morning-scan", "do the scan") == {"turn_id": "t"}
+    assert len(attempts) == 2
+
+
+def test_a_failed_dispatch_is_logged_not_only_printed(monkeypatch, caplog):
+    """cron runs with MAILTO="" and no redirect, so stderr goes nowhere: the
+    log is the only place a lost morning brief can show up."""
+    settings.internal_socket_path.unlink(missing_ok=True)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    with caplog.at_level("ERROR"), pytest.raises(SystemExit):
+        entrypoint.post_job("morning-scan", "do the scan")
+    assert any(
+        "morning-scan" in record.getMessage() and record.levelname == "ERROR"
+        for record in caplog.records
+    )
+
+
+def test_an_http_error_is_not_retried(monkeypatch):
+    """The server answered: retrying would only repeat its answer."""
+    attempts = []
+
+    def refuses(sock, path, body, timeout):
+        attempts.append(path)
+        raise entrypoint.InternalAPIError("server returned HTTP 500", status=500)
+
+    monkeypatch.setattr(entrypoint, "post_json", refuses)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    with pytest.raises(SystemExit):
+        entrypoint.post_job("morning-scan", "do the scan")
+    assert len(attempts) == 1
+
+
+def test_the_cron_process_never_rotates_the_server_log(tmp_path):
+    """RotatingFileHandler is not multi-process safe (server/log.py,
+    get_deny_logger). The server owns rotation of marlow-server.log; the cron
+    process, a second writer, must only append."""
+    probe = (
+        "import logging, sys; sys.argv = ['entrypoint.py']; "
+        "import cron.entrypoint; "
+        "from logging.handlers import RotatingFileHandler; "
+        "names = ['cron.entrypoint', 'server.schedules', 'server.preferences']; "
+        "print(any(isinstance(h, RotatingFileHandler) "
+        "for n in names for h in logging.getLogger(n).handlers))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=_REPO_ROOT,
+        env=_minimal_env(tmp_path, MARLOW_SERVER_REPO=str(_REPO_ROOT)),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"

@@ -278,3 +278,57 @@ def test_a_failed_token_write_leaves_no_half_paired_token(monkeypatch):
     with pytest.raises(OSError):
         store.redeem(store.issue_invite("iPhone"), "iPhone")
     assert set(store._tokens) == before
+
+
+def test_a_failed_token_write_leaves_the_file_on_disk_whole(monkeypatch, tmp_path):
+    """Written in place, a full disk left half a file, the next start loaded
+    it as corrupt, and every paired device got 401 until re-paired over SSH."""
+    from pathlib import Path
+
+    from server import config
+
+    monkeypatch.setattr(
+        "server.pairing.settings", type(config.settings)(data_dir=tmp_path, log_dir=tmp_path)
+    )
+    store = PairingStore()
+    token = store.redeem(store.issue_invite("iPhone"), "iPhone")
+    real_write_text = Path.write_text
+
+    def torn(self, data, *args, **kwargs):
+        real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "write_text", torn)
+        with pytest.raises(OSError):
+            store.redeem(store.issue_invite("iPad"), "iPad")
+
+    assert PairingStore().is_valid_token(token)
+
+
+def test_revoking_a_device_forgets_its_location():
+    """A lost phone's last fix otherwise kept feeding every turn, the
+    morning brief included, for up to 36 hours after it was revoked."""
+    from server.location import Location, location_store
+
+    token = pairing_store.redeem(pairing_store.issue_invite("Lost phone"), "Lost phone")
+    location_store.report(token, Location(46.81, -71.21))
+
+    pairing_store.revoke(token)
+
+    assert location_store.latest() is None
+
+
+def test_reads_of_the_token_table_wait_for_a_writer():
+    """`redeem` runs on a worker thread; iterating the dict while it adds a
+    key raises "dictionary changed size during iteration"."""
+    import threading
+
+    store = PairingStore()
+    with store._lock:
+        reader = threading.Thread(target=lambda: (store.list_devices(), store.latest_timezone()))
+        reader.start()
+        reader.join(0.2)
+        assert reader.is_alive(), "read the token table while a writer held the lock"
+    reader.join(2)
+    assert not reader.is_alive()

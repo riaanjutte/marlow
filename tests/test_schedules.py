@@ -831,3 +831,80 @@ def test_turning_checkins_off_drops_their_line(tmp_path, monkeypatch):
     sync_after_turn(_write_store(tmp_path, []))
     [text] = installed
     assert not any("email-flash" in line for line in _job_lines(text))
+
+
+_MEDS = {"id": "meds", "cron": "0 12 * * *", "notify": "Take your meds"}
+
+
+def _last_good(monkeypatch, tmp_path, *, installs: bool = True) -> Path:
+    """Points the last-good copy into tmp_path and makes install() report
+    `installs`. Returns where the copy lives."""
+    from dataclasses import replace
+
+    _capture_install(monkeypatch, tmp_path)
+    monkeypatch.setattr(schedules_module, "install", lambda text: installs)
+    monkeypatch.setattr(
+        schedules_module, "settings", replace(schedules_module.settings, data_dir=tmp_path / "data")
+    )
+    return tmp_path / "data" / "schedules.last-good.json"
+
+
+def test_an_installed_store_is_kept_as_the_last_good_copy(tmp_path, monkeypatch):
+    """The cron entrypoint fires from this copy when a later edit is refused,
+    so it must be exactly what the installed crontab was rendered from."""
+    last_good = _last_good(monkeypatch, tmp_path)
+    path = _write_store(tmp_path, [_MEDS])
+
+    sync_after_turn(path)
+
+    assert json.loads(last_good.read_text()) == json.loads(path.read_text())
+
+
+def test_a_refused_store_leaves_the_last_good_copy_alone(tmp_path, monkeypatch):
+    last_good = _last_good(monkeypatch, tmp_path)
+    path = _write_store(tmp_path, [_MEDS])
+    sync_after_turn(path)
+    good = last_good.read_text()
+
+    _write_store(tmp_path, [{"id": "Bad Id", "cron": "0 1 * * *", "prompt": "x"}])
+    sync_after_turn(path)
+
+    assert last_good.read_text() == good
+
+
+def test_a_failed_install_does_not_move_the_last_good_copy(tmp_path, monkeypatch):
+    """A crontab that did not install is not the one firing."""
+    last_good = _last_good(monkeypatch, tmp_path, installs=False)
+    sync_after_turn(_write_store(tmp_path, [_MEDS]))
+    assert not last_good.exists()
+
+
+def test_a_deleted_store_drops_the_last_good_copy(tmp_path, monkeypatch):
+    """No store renders an empty table; a copy left behind would fire the
+    deleted reminders from it."""
+    last_good = _last_good(monkeypatch, tmp_path)
+    path = _write_store(tmp_path, [_MEDS])
+    sync_after_turn(path)
+    path.unlink()
+
+    sync_after_turn(path)
+
+    assert not last_good.exists()
+
+
+def test_a_failed_prune_write_leaves_the_store_whole(tmp_path, monkeypatch):
+    """Written in place, a full disk left half a store, and one bad store
+    stops every --entry line. Cron and a running turn both write this file."""
+    path = _write_store(tmp_path, [_entry(id="keep"), _entry(id="fired")])
+    before = path.read_text()
+    real_write_text = Path.write_text
+
+    def torn(self, data, *args, **kwargs):
+        real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_text", torn)
+    assert prune_fired(path, "fired") is False
+    monkeypatch.undo()
+
+    assert path.read_text() == before

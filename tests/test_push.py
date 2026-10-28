@@ -69,6 +69,21 @@ def test_dispatch_noops_when_device_has_no_apns_token_registered(monkeypatch, pa
     assert fake_client.sent == []
 
 
+def test_push_logs_name_a_device_by_fingerprint_never_by_its_token(monkeypatch, pair_device, caplog):
+    """The token is a bearer credential and the logs are readable from a turn.
+    `pairing.fingerprint` is the one loggable name for a device."""
+    from server.pairing import fingerprint
+
+    monkeypatch.setattr(push_module, "_get_client", lambda: _FakeClient())
+    token = pair_device("iPhone")
+
+    with caplog.at_level("INFO"):
+        asyncio.run(dispatch(token, PushPayload(type=PushType.TURN_READY, ref="turn-1")))
+
+    assert fingerprint(token) in caplog.text
+    assert token[:8] not in caplog.text
+
+
 def test_permission_push_carries_only_its_summary_and_review_deny(monkeypatch, pair_device):
     """Since 2026-10-02 a permission push says what Marlow wants to do (Mike's
     call; push.py's docstring). What it carries is exactly the title and body it
