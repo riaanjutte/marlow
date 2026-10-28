@@ -972,6 +972,41 @@ def test_errored_retiring_turn_does_not_retire_anything(tmp_path, monkeypatch):
     asyncio.run(_body())
 
 
+def test_a_turn_with_a_denied_tool_neither_retires_its_session_nor_goes_unseen(monkeypatch):
+    """A denied tool still exits 0 with is_error false (CLAUDE.md), so the
+    turn is DONE. Consolidate unattended is denied anything that needs
+    approval -- an edit to USER.md -- and a DONE that ignored the denial
+    retired the day it had not finished, silently, as plumbing."""
+    pushes = []
+    monkeypatch.setattr("server.queue.push_broadcast_nowait", pushes.append)
+
+    async def _denied(prompt, **kwargs):
+        return InvocationResult(
+            exit_code=0, is_error=False, subtype="success", result_text="done",
+            session_id=kwargs.get("session_id"), permission_denials=[{"tool_name": "Edit"}],
+        )
+
+    monkeypatch.setattr("server.queue.run_claude", _denied)
+
+    async def _body():
+        wq = WorkQueue()
+        wq.start()
+        turn_id = wq.enqueue(
+            "review today", session_id="attended-1", resume=True, source="cron",
+            require_session=True, retire_session_on_success=True,
+            label="consolidate", tier="plumbing",
+        )
+        turn = await _run_to_completion(wq, turn_id)
+        assert turn.status == TurnStatus.DONE
+        assert wq.is_session_retired("attended-1") is False
+        await _wait_for(lambda: pushes, "the denial's push")
+        await wq.stop()
+        return turn_id
+
+    turn_id = asyncio.run(_body())
+    assert [payload.ref for payload in pushes] == [turn_id]
+
+
 def test_non_retiring_cron_job_never_retires_its_session():
     # A cron job outside ATTACHED_SESSION_JOBS (retire_session_on_success
     # defaults to False) must not retire anything even though it succeeds --
